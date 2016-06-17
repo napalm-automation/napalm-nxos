@@ -241,6 +241,67 @@ class NXOSDriver(NetworkDriver):
 
         return results
 
+
+    class DeviceData(object):
+        """Proof-of-concept implementation of data hierarchy."""
+        # TODO discuss with team, see if useful, and determine where
+        # this class should live.  Can replace this with a raw dict if
+        # that would be better.
+        #
+        # This class could have also implemented the model checks in
+        # napalm_base.test.models, but I didn't want to invest more
+        # time in it without determining the correct direction.
+        @staticmethod
+        def convert_dict(d):
+            for key, value in d.iteritems():
+                if isinstance(value, dict):
+                    d[key] = NXOSDriver.DeviceData.convert_dict(value)
+                if isinstance(value, NXOSDriver.DeviceData):
+                    d[key] = value.to_dict()
+            return d
+
+        def to_dict(self):
+            return NXOSDriver.DeviceData.convert_dict(self.__dict__)
+
+    class AddressFamilyData(DeviceData):
+        """Required data structs with sensible defaults."""
+        def __init__(self):
+            self.sent_prefixes = -1
+            self.accepted_prefixes = -1
+            self.received_prefixes = -1
+
+    class PeerData(DeviceData):
+        def __init__(self):
+            self.is_enabled = True
+            self.uptime = -1
+            self.remote_as = -1
+            self.description = unicode('')
+            self.remote_id = 'remote_id'
+            self.local_as = -1
+            self.is_up = True
+            self.address_family = {}
+
+    def get_bgp_neighbors(self):
+        cmd = 'show bgp sessions vrf all'
+        tbl = self._get_command_table(cmd, 'TABLE_vrf', 'ROW_vrf')
+
+        ret = {}
+        for el in tbl:
+            hsh = {}
+            hsh['router_id'] = unicode(el['router-id'])
+            hsh['peers'] = {}
+            for p in el['TABLE_neighbor']['ROW_neighbor']:
+                peer = NXOSDriver.PeerData()
+                peer.address_family = { 'ipv4': NXOSDriver.AddressFamilyData() }
+                peer.local_as = int(el['local-as'])
+                peer.remote_as = int(p['remoteas'])
+                neighborid = unicode(p['neighbor-id'])
+                peer.remote_id = neighborid
+                hsh['peers'][neighborid] = peer.to_dict()
+            ret[el['vrf-name-out']] = hsh
+        return ret
+
+
     def get_checkpoint_file(self):
         return install_config.get_checkpoint(self.device)
 
