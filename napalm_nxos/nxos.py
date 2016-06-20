@@ -244,30 +244,30 @@ class NXOSDriver(NetworkDriver):
 
     def get_bgp_neighbors(self):
         cmd = 'show bgp sessions vrf all'
-        tbl = self._get_command_table(cmd, 'TABLE_vrf', 'ROW_vrf')
+        vrf_list = self._get_command_table(cmd, 'TABLE_vrf', 'ROW_vrf')
 
-        ret = {}
-        for el in tbl:
-            hsh = {}
-            hsh['router_id'] = unicode(el['router-id'])
-            hsh['peers'] = {}
+        results = {}
+        for vrf_dict in vrf_list:
+            result_vrf_dict = {}
+            result_vrf_dict['router_id'] = unicode(vrf_dict['router-id'])
+            result_vrf_dict['peers'] = {}
 
-            neighbors = el.get('TABLE_neighbor', {}).get('ROW_neighbor', [])
-            if isinstance(neighbors, dict):
-                neighbors = [neighbors]
-            for p in neighbors:
-                neighborid = unicode(p['neighbor-id'])
+            neighbors_list = vrf_dict.get('TABLE_neighbor', {}).get('ROW_neighbor', [])
+            if isinstance(neighbors_list, dict):
+                neighbors_list = [neighbors_list]
+            for neighbor_dict in neighbors_list:
+                neighborid = unicode(neighbor_dict['neighbor-id'])
 
-                peer_hsh = {
-                    'local_as': int(el['local-as']),
-                    'remote_as': int(p['remoteas']),
+                result_peer_dict = {
+                    'local_as': int(vrf_dict['local-as']),
+                    'remote_as': int(neighbor_dict['remoteas']),
                     'remote_id': neighborid,
                     'is_enabled': True,
                     'uptime': -1,
                     'description': unicode(''),
                     'is_up': True
                 }
-                peer_hsh['address_family'] = {
+                result_peer_dict['address_family'] = {
                     'ipv4': {
                         'sent_prefixes': -1,
                         'accepted_prefixes': -1,
@@ -275,10 +275,10 @@ class NXOSDriver(NetworkDriver):
                     }
                 }
 
-                hsh['peers'][neighborid] = peer_hsh
+                result_vrf_dict['peers'][neighborid] = result_peer_dict
 
-            ret[el['vrf-name-out']] = hsh
-        return ret
+            results[vrf_dict['vrf-name-out']] = result_vrf_dict
+        return results
 
 
     def get_checkpoint_file(self):
