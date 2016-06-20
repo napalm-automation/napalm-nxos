@@ -245,6 +245,8 @@ class NXOSDriver(NetworkDriver):
     def get_bgp_neighbors(self):
         cmd = 'show bgp sessions vrf all'
         vrf_list = self._get_command_table(cmd, 'TABLE_vrf', 'ROW_vrf')
+        if isinstance(vrf_list, dict):
+            vrf_list = [vrf_list]
 
         results = {}
         for vrf_dict in vrf_list:

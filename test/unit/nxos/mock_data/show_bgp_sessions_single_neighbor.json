@@ -13,8 +13,7 @@
           "totalestablishedpeers": "3",
           "localas": "11111",
           "TABLE_vrf": {
-            "ROW_vrf": [
-              {
+            "ROW_vrf": {
                 "vrf-name-out": "VRF_1",
                 "local-as": "11111",
                 "vrfpeers": "2",
@@ -36,8 +35,7 @@
                       "notificationsreceived": "0"
                     }
                 }
-              }
-            ]
+            }
           }
         }
       }

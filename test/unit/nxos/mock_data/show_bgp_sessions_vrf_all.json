@@ -58,7 +58,7 @@
                 "vrfestablishedpeers": "1",
                 "router-id": "10.10.10.10",
                 "TABLE_neighbor": {
-                  "ROW_neighbor": [
+                  "ROW_neighbor":
                     {
                       "neighbor-id": "40.40.40.40",
                       "remoteas": "11111",
@@ -72,7 +72,6 @@
                       "notificationssent": "1",
                       "notificationsreceived": "0"
                     }
-                  ]
                 }
               }
             ]
