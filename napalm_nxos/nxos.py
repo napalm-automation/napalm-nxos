@@ -251,7 +251,11 @@ class NXOSDriver(NetworkDriver):
             hsh = {}
             hsh['router_id'] = unicode(el['router-id'])
             hsh['peers'] = {}
-            for p in el['TABLE_neighbor']['ROW_neighbor']:
+
+            neighbors = el.get('TABLE_neighbor', {}).get('ROW_neighbor', [])
+            if isinstance(neighbors, dict):
+                neighbors = [neighbors]
+            for p in neighbors:
                 neighborid = unicode(p['neighbor-id'])
 
                 peer_hsh = {

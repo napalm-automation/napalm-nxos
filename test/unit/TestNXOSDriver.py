@@ -139,6 +139,31 @@ class TestNXOSDriver_bgp_neighbors(unittest.TestCase):
         self.set_bgp_return_data('show_bgp_sessions_bad_return.json')
         self.assertEqual(self.driver.get_bgp_neighbors(), {})
 
+    def test_single_neighbor_works(self):
+        # TODO: discuss w/ team, verify that this is the expected
+        # data format and behaviour.
+        self.set_bgp_return_data('show_bgp_sessions_single_neighbor.json')
+        expected_data = {
+            'VRF_1': {
+                'router_id': u'10.10.10.10',
+                'peers': {
+                    u'20.20.20.20': {
+                        'address_family': {
+                            'ipv4': {'accepted_prefixes': -1,
+                                     'received_prefixes': -1,
+                                     'sent_prefixes': -1}},
+                        'description': u'',
+                        'is_enabled': True,
+                        'is_up': True,
+                        'local_as': 11111,
+                        'remote_as': 22222,
+                        'remote_id': u'20.20.20.20',
+                        'uptime': -1}
+                    }
+                }
+            }
+        self.assertEqual(self.driver.get_bgp_neighbors(), expected_data)
+
 
 class FakeNXOSDevice(object):
 
