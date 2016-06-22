@@ -17,6 +17,7 @@ import unittest
 from napalm_nxos.nxos import NXOSDriver
 from napalm_base.test.base import TestConfigNetworkDriver, TestGettersNetworkDriver
 import re
+import os
 
 # class TestConfigNXOSDriver(unittest.TestCase, TestConfigNetworkDriver):
 
@@ -71,10 +72,12 @@ class FakeNXOSDevice(object):
             extension = 'txt'
 
         filename = re.sub(r'[\[\]\*\^\+\s\|\/]', '_', command)
-        mock_file = 'nxos/mock_data/{filename}.{extension}'.format(
+        mock_file = '{filename}.{extension}'.format(
             filename  = filename[0:150],
             extension = extension
         )
+        curr_dir = os.path.dirname(os.path.abspath(__file__))
+        mock_file = os.path.join(curr_dir, 'nxos', 'mock_data', mock_file)
         mock_data = self.read_txt_file(mock_file)
         if text:
             mock_data = {
