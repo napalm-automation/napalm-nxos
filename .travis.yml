@@ -32,4 +32,5 @@ script:
 - nosetests -v TestNXOSDriver:TestGetterNXOSDriver.test_get_users
 - nosetests -v TestNXOSDriver:TestGetterNXOSDriver.test_traceroute
 - nosetests -v TestNXOSDriver:TestNXOSDriver_bgp_neighbors
+- nosetests -v TestNXOSDriver:TestNXOSDriver_get_interfaces_ip
 - cd ../..
