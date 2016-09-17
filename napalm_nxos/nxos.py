@@ -204,6 +204,33 @@ class NXOSDriver(NetworkDriver):
                 iface_list.append(intf)
 
         return results
+  
+    def get_fex_information(self):
+        item_list = list()
+
+        fex_command = 'show fex'
+
+        fex_raw_output = self.cli([fex_command]).get(fex_command, '')
+
+        fex_results = napalm_base.helpers.textfsm_extractor(self, 'cisco_nxos_show_fex', fex_raw_output)
+
+        i = 0
+        results = []
+        while i < 99:
+           try:
+             item_list = {
+                 'fex_number' :(fex_results[i].get('number'," ")),
+                 'fex_description' :(fex_results[i].get('descr'," ")),
+                 'fex_state' :(fex_results[i].get('state'," ")),
+                 'fex_model' :(fex_results[i].get('model'," ")),
+                 'fex_serial' :(fex_results[i].get('serial'," "))
+             }
+             results.append(item_list)
+             i = i + 1
+           except:
+             i = 100
+
+        return results
         
     def get_fex_status(self):
         item_list = list()
