@@ -255,7 +255,7 @@ class NXOSDriver(NetworkDriver):
             except:
               i = 201
 
-       return results
+        return results
         
     def get_interfaces(self):
         results = {}
