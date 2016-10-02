@@ -21,4 +21,4 @@ try:
 except pkg_resources.DistributionNotFound:
     __version__ = "Not installed"
 
-__all__= ['NXOSDriver']
+__all__= ('NXOSDriver',)
