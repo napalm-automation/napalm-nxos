@@ -17,6 +17,7 @@ from __future__ import unicode_literals
 
 # import stdlib
 import re
+import json
 import time
 import tempfile
 from datetime import datetime
@@ -31,6 +32,10 @@ from pynxos.features.file_copy import FileTransferError as NXOSFileTransferError
 from pynxos.features.file_copy import FileCopy
 from pynxos.errors import CLIError
 
+from netmiko import ConnectHandler
+from netmiko import __version__ as netmiko_version
+from netmiko.ssh_exception import NetMikoTimeoutException
+
 # import NAPALM Base
 import napalm_base.helpers
 from napalm_base import NetworkDriver
@@ -41,6 +46,12 @@ from napalm_base.exceptions import CommandErrorException
 from napalm_base.exceptions import ReplaceConfigException
 import napalm_base.constants as c
 
+UPTIME_KEY_MAP = {
+    'kern_uptm_days': 'up_days',
+    'kern_uptm_hrs': 'up_hours',
+    'kern_uptm_mins': 'up_mins',
+    'kern_uptm_secs': 'up_secs'
+}
 
 class NXOSDriver(NetworkDriver):
     def __init__(self, hostname, username, password, timeout=60, optional_args=None):
@@ -57,6 +68,7 @@ class NXOSDriver(NetworkDriver):
         self.changed = False
         self.replace_file = None
         self.merge_candidate = ''
+        self.ssh_connection = False
 
         if optional_args is None:
             optional_args = {}
@@ -67,8 +79,52 @@ class NXOSDriver(NetworkDriver):
             self.port = optional_args.get('port', 443)
         elif self.transport == 'http':
             self.port = optional_args.get('port', 80)
+        elif self.transport == 'netmiko_nxos':
+            # Netmiko possible arguments
+            netmiko_argument_map = {
+                'port': None,
+                'verbose': False,
+                'global_delay_factor': 1,
+                'use_keys': False,
+                'key_file': None,
+                'ssh_strict': False,
+                'system_host_keys': False,
+                'alt_host_keys': False,
+                'alt_key_file': '',
+                'ssh_config_file': None,
+            }
 
-    def open(self):
+            fields = netmiko_version.split('.')
+            fields = [int(x) for x in fields]
+            maj_ver, min_ver, bug_fix = fields
+            if maj_ver >= 2:
+                netmiko_argument_map['allow_agent'] = False
+            elif maj_ver == 1 and min_ver >= 1:
+                netmiko_argument_map['allow_agent'] = False
+
+            # Build dict of any optional Netmiko args
+            self.netmiko_optional_args = {}
+            for k, v in netmiko_argument_map.items():
+                try:
+                    self.netmiko_optional_args[k] = optional_args[k]
+                except KeyError:
+                    pass
+            self.global_delay_factor = optional_args.get('global_delay_factor', 1)
+            self.port = optional_args.get('port', 22)
+            self.sudo_pwd = optional_args.get('sudo_pwd', self.password)
+
+    def _open_ssh_session(self):
+        try:
+            self.device = ConnectHandler(device_type='cisco_nxos',
+                                         host=self.hostname,
+                                         username=self.username,
+                                         password=self.password,
+                                         **self.netmiko_optional_args)
+            self.ssh_connection = True
+        except NetMikoTimeoutException:
+            raise ConnectionException('Cannot connect to {}'.format(self.hostname))
+
+    def _open_nxapi_session(self):
         try:
             self.device = NXOSDevice(self.hostname,
                                      self.username,
@@ -82,9 +138,20 @@ class NXOSDriver(NetworkDriver):
             # unable to open connection
             raise ConnectionException('Cannot connect to {}'.format(self.hostname))
 
+    def open(self):
+        if self.transport == 'netmiko_nxos':
+            self._open_ssh_session()
+        else:
+            self._open_nxapi_session()
+
+    def _close_ssh_session(self):
+        self.device.disconnect()
+
     def close(self):
         if self.changed:
             self._delete_file(self.backup_file)
+        if self.ssh_connection:
+            self._close_ssh_session()
         self.device = None
 
     @staticmethod
@@ -169,14 +236,26 @@ class NXOSDriver(NetworkDriver):
         return self._get_table_rows(result, table_name, row_name)
 
     def _get_command_table(self, command, table_name, row_name):
-        json_output = self.device.show(command)
+        if self.ssh_connection:
+            command += ' | json'
+            try:
+                json_output = json.loads(self.device.send_command_timing(command))
+            except ValueError:
+                json_output = {}
+        else:
+            json_output = self.device.show(command)
         return self._get_reply_table(json_output, table_name, row_name)
 
     def is_alive(self):
-        if self.device:
-            return {'is_alive': True}
+        if self.ssh_connection:
+            return {
+            'is_alive': self.device.remote_conn.transport.is_active()
+        }
         else:
-            return {'is_alive': False}
+            if self.device:
+                return {'is_alive': True}
+            else:
+                return {'is_alive': False}
 
     def load_replace_candidate(self, filename=None, config=None):
         self.replace = True
@@ -331,6 +410,15 @@ class NXOSDriver(NetworkDriver):
         self.device.show('delete {}'.format(filename), raw_text=True)
         self.device.show('no terminal dont-ask', raw_text=True)
 
+    def _delete_file_ssh(self, filename):
+        commands_list = [
+            'terminal dont-ask',
+            'delete {}'.format(filename),
+            'no terminal dont-ask'
+        ]
+        for command in commands_list:
+            self.device.send_command(command)
+
     def discard_config(self):
         if self.loaded:
             self.merge_candidate = ''  # clear the buffer
@@ -347,20 +435,51 @@ class NXOSDriver(NetworkDriver):
             self.device.save()
             self.changed = False
 
+    def _apply_key_map(self, key_map, table):
+        new_dict = {}
+        for key, value in table.items():
+            new_key = key_map.get(key)
+            if new_key:
+                new_dict[new_key] = str(value)
+        return new_dict
+
+    def _convert_uptime_to_seconds(self, uptime_facts):
+        seconds = int(uptime_facts['up_days']) * 24 * 60 * 60
+        seconds += int(uptime_facts['up_hours']) * 60 * 60
+        seconds += int(uptime_facts['up_mins']) * 60
+        seconds += int(uptime_facts['up_secs'])
+        return seconds
+
     def get_facts(self):
-        pynxos_facts = self.device.facts
-        final_facts = {key: value for key, value in pynxos_facts.items() if
-                       key not in ['interfaces', 'uptime_string', 'vlans']}
+        final_facts = {}
+        if self.ssh_connection:
+            show_ver_output = json.loads(self.device.send_command_timing('show version | json'))
+            uptime_facts = self._apply_key_map(UPTIME_KEY_MAP, show_ver_output)
+            final_facts['uptime']  = self._convert_uptime_to_seconds(uptime_facts)
+            final_facts['os_version'] = show_ver_output.get('kickstart_ver_str')
+            final_facts['serial_number'] = show_ver_output.get('proc_board_id')
+            final_facts['model'] = show_ver_output.get('chassis_id')
+            final_facts['serial_number'] = show_ver_output.get('proc_board_id')
+            final_facts['hostname'] = show_ver_output.get('host_name')
 
-        if pynxos_facts['interfaces']:
-            final_facts['interface_list'] = pynxos_facts['interfaces']
+            interfaces_output = self.device.send_command_timing('show interface status | json')
+            interface_list = json.loads(interfaces_output)['TABLE_interface']['ROW_interface']
+            interfaces = [intf['interface'] for intf in interface_list]
+            final_facts['interface_list'] = interfaces
         else:
-            final_facts['interface_list'] = self.get_interfaces().keys()
+            pynxos_facts = self.device.facts
+            final_facts = {key: value for key, value in pynxos_facts.items() if
+                           key not in ['interfaces', 'uptime_string', 'vlans']}
 
+            if pynxos_facts['interfaces']:
+                final_facts['interface_list'] = pynxos_facts['interfaces']
+            else:
+                final_facts['interface_list'] = self.get_interfaces().keys()
+
+            hostname_cmd = 'show hostname'
+            hostname = self.device.show(hostname_cmd).get('hostname')
+        
         final_facts['vendor'] = 'Cisco'
-
-        hostname_cmd = 'show hostname'
-        hostname = self.device.show(hostname_cmd).get('hostname')
         if hostname:
             final_facts['fqdn'] = hostname
 
@@ -369,7 +488,11 @@ class NXOSDriver(NetworkDriver):
     def get_interfaces(self):
         interfaces = {}
         iface_cmd = 'show interface'
-        interfaces_out = self.device.show(iface_cmd)
+        if self.ssh_connection:
+            iface_cmd += ' | json'
+            interfaces_out = json.loads(self.device.send_command_timing(iface_cmd))
+        else:
+            interfaces_out = self.device.show(iface_cmd)
         interfaces_body = interfaces_out['TABLE_interface']['ROW_interface']
 
         for interface_details in interfaces_body:
@@ -378,7 +501,7 @@ class NXOSDriver(NetworkDriver):
             interface_speed = interface_details.get('eth_bw', 0)
             if isinstance(interface_speed, list):
                 interface_speed = interface_speed[0]
-            interface_speed = int(interface_speed / 1000)
+            interface_speed = int(interface_speed) / 1000
             if 'admin_state' in interface_details:
                 is_up = interface_details.get('admin_state', '') == 'up'
             else:
@@ -399,7 +522,10 @@ class NXOSDriver(NetworkDriver):
         results = {}
         try:
             command = 'show lldp neighbors'
-            lldp_raw_output = self.cli([command]).get(command, '')
+            if self.ssh_connection:
+                lldp_raw_output = self.device.send_command_timing(command)
+            else:
+                lldp_raw_output = self.cli([command]).get(command, '')
             lldp_neighbors = napalm_base.helpers.textfsm_extractor(
                                 self, 'lldp_neighbors', lldp_raw_output)
         except CLIError:
@@ -464,13 +590,21 @@ class NXOSDriver(NetworkDriver):
 
     def _set_checkpoint(self, filename):
         commands = ['terminal dont-ask', 'checkpoint file {0}'.format(filename)]
-        self.device.config_list(commands)
+        if self.ssh_connection:
+            for command in commands:
+                self.device.send_command(command)
+        else:
+            self.device.config_list(commands)
 
     def _get_checkpoint_file(self):
         filename = 'temp_cp_file_from_napalm'
         self._set_checkpoint(filename)
-        cp_out = self.device.show('show file {0}'.format(filename), raw_text=True)
-        self._delete_file(filename)
+        if self.ssh_connection:
+            cp_out = self.device.send_command_timing('show file {0}'.format(filename))
+            self._delete_file_ssh(filename)
+        else:
+            cp_out = self.device.show('show file {0}'.format(filename), raw_text=True)
+            self._delete_file(filename)
         return cp_out
 
     def get_lldp_neighbors_detail(self, interface=''):
@@ -483,7 +617,10 @@ class NXOSDriver(NetworkDriver):
         # seems that some old devices may not return JSON output...
 
         try:
-            lldp_neighbors_table_str = self.cli([command]).get(command)
+            if self.ssh_connection:
+                lldp_neighbors_table_str = self.device.send_command_timing(command)
+            else:
+                lldp_neighbors_table_str = self.cli([command]).get(command)
             # thus we need to take the raw text output
             lldp_neighbors_list = lldp_neighbors_table_str.splitlines()
         except CLIError:
@@ -561,13 +698,17 @@ class NXOSDriver(NetworkDriver):
             raise TypeError('Please enter a valid list of commands!')
 
         for command in commands:
-            command_output = self.device.show(command, raw_text=True)
+            if self.ssh_connection:
+                command_output = self.device.send_command_timing(command)
+            else:
+                command_output = self.device.show(command, raw_text=True)
             cli_output[py23_compat.text_type(command)] = command_output
         return cli_output
 
     def get_arp_table(self):
         arp_table = []
         command = 'show ip arp'
+
         arp_table_vrf = self._get_command_table(command, 'TABLE_vrf', 'ROW_vrf')
         arp_table_raw = self._get_table_rows(arp_table_vrf[0], 'TABLE_adj', 'ROW_adj')
 
@@ -734,7 +875,10 @@ class NXOSDriver(NetworkDriver):
     def get_snmp_information(self):
         snmp_information = {}
         snmp_command = 'show running-config'
-        snmp_raw_output = self.cli([snmp_command]).get(snmp_command, '')
+        if self.ssh_connection:
+            snmp_raw_output = self.device.send_command_timing(snmp_command)
+        else:
+            snmp_raw_output = self.cli([snmp_command]).get(snmp_command, '')
         snmp_config = napalm_base.helpers.textfsm_extractor(self, 'snmp_config', snmp_raw_output)
 
         if not snmp_config:
@@ -787,7 +931,10 @@ class NXOSDriver(NetworkDriver):
 
         users = {}
         command = 'show running-config'
-        section_username_raw_output = self.cli([command]).get(command, '')
+        if self.ssh_connection:
+            section_username_raw_output = self.device.send_command_timing(command)
+        else:
+            section_username_raw_output = self.cli([command]).get(command, '')
         section_username_tabled_output = napalm_base.helpers.textfsm_extractor(
             self, 'users', section_username_raw_output)
 
@@ -870,7 +1017,10 @@ class NXOSDriver(NetworkDriver):
         )
 
         try:
-            traceroute_raw_output = self.cli([command]).get(command)
+            if self.ssh_connection:
+                traceroute_raw_output = self.device.send_command_timing(command)
+            else:
+                traceroute_raw_output = self.cli([command]).get(command)
         except CommandErrorException:
             return {'error': 'Cannot execute traceroute on the device: {}'.format(command)}
 
@@ -921,8 +1071,14 @@ class NXOSDriver(NetworkDriver):
 
         if retrieve.lower() in ('running', 'all'):
             _cmd = 'show running-config'
-            config['running'] = py23_compat.text_type(self.cli([_cmd]).get(_cmd))
+            if self.ssh_connection:
+                config['running'] = py23_compat.text_type(self.device.send_command_timing(_cmd))
+            else:
+                config['running'] = py23_compat.text_type(self.cli([_cmd]).get(_cmd))
         if retrieve.lower() in ('startup', 'all'):
             _cmd = 'show startup-config'
-            config['startup'] = py23_compat.text_type(self.cli([_cmd]).get(_cmd))
+            if self.ssh_connection:
+                config['startup'] = py23_compat.text_type(self.device.send_command_timing(_cmd))
+            else:
+                config['startup'] = py23_compat.text_type(self.cli([_cmd]).get(_cmd))
         return config
