@@ -53,6 +53,7 @@ UPTIME_KEY_MAP = {
     'kern_uptm_secs': 'up_secs'
 }
 
+
 class NXOSDriver(NetworkDriver):
     def __init__(self, hostname, username, password, timeout=60, optional_args=None):
         if optional_args is None:
@@ -241,7 +242,7 @@ class NXOSDriver(NetworkDriver):
             try:
                 json_output = json.loads(self.device.send_command_timing(command))
             except ValueError:
-                json_output = {}
+                return {}
         else:
             json_output = self.device.show(command)
         return self._get_reply_table(json_output, table_name, row_name)
@@ -249,8 +250,8 @@ class NXOSDriver(NetworkDriver):
     def is_alive(self):
         if self.ssh_connection:
             return {
-            'is_alive': self.device.remote_conn.transport.is_active()
-        }
+                'is_alive': self.device.remote_conn.transport.is_active()
+                }
         else:
             if self.device:
                 return {'is_alive': True}
@@ -455,7 +456,7 @@ class NXOSDriver(NetworkDriver):
         if self.ssh_connection:
             show_ver_output = json.loads(self.device.send_command_timing('show version | json'))
             uptime_facts = self._apply_key_map(UPTIME_KEY_MAP, show_ver_output)
-            final_facts['uptime']  = self._convert_uptime_to_seconds(uptime_facts)
+            final_facts['uptime'] = self._convert_uptime_to_seconds(uptime_facts)
             final_facts['os_version'] = show_ver_output.get('kickstart_ver_str')
             final_facts['serial_number'] = show_ver_output.get('proc_board_id')
             final_facts['model'] = show_ver_output.get('chassis_id')
@@ -478,7 +479,7 @@ class NXOSDriver(NetworkDriver):
 
             hostname_cmd = 'show hostname'
             hostname = self.device.show(hostname_cmd).get('hostname')
-        
+
         final_facts['vendor'] = 'Cisco'
         if hostname:
             final_facts['fqdn'] = hostname
