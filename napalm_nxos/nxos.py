@@ -328,7 +328,6 @@ class NXOSDriver(NetworkDriver):
 
         kwargs = dict(ssh_conn=self.device, source_file=source_file, dest_file=dest_file,
                       direction='put', file_system=file_system)
-        print ("EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEe", file_system)
         enable_scp = True
         with TransferClass(**kwargs) as transfer:
 
