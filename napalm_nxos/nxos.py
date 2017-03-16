@@ -21,6 +21,7 @@ import json
 import time
 import tempfile
 from datetime import datetime
+from distutils.version import LooseVersion
 from requests.exceptions import ConnectionError
 
 # import third party lib
@@ -32,7 +33,7 @@ from pynxos.features.file_copy import FileTransferError as NXOSFileTransferError
 from pynxos.features.file_copy import FileCopy
 from pynxos.errors import CLIError
 
-from netmiko import ConnectHandler
+from netmiko import ConnectHandler, FileTransfer
 from netmiko import __version__ as netmiko_version
 from netmiko.ssh_exception import NetMikoTimeoutException
 
@@ -85,6 +86,7 @@ class NXOSDriver(NetworkDriver):
             netmiko_argument_map = {
                 'port': None,
                 'verbose': False,
+                'timeout': self.timeout,
                 'global_delay_factor': 1,
                 'use_keys': False,
                 'key_file': None,
@@ -95,22 +97,16 @@ class NXOSDriver(NetworkDriver):
                 'ssh_config_file': None,
             }
 
-            fields = netmiko_version.split('.')
-            fields = [int(x) for x in fields]
-            maj_ver, min_ver, bug_fix = fields
-            if maj_ver >= 2:
-                netmiko_argument_map['allow_agent'] = False
-            elif maj_ver == 1 and min_ver >= 1:
+            if (LooseVersion(netmiko_version) >= LooseVersion('2.0.0') or
+                    LooseVersion(netmiko_version) >= LooseVersion('1.1.0')):
                 netmiko_argument_map['allow_agent'] = False
 
             # Build dict of any optional Netmiko args
-            self.netmiko_optional_args = {}
-            for k, v in netmiko_argument_map.items():
-                try:
-                    self.netmiko_optional_args[k] = optional_args[k]
-                except KeyError:
-                    pass
-            self.global_delay_factor = optional_args.get('global_delay_factor', 1)
+            self.netmiko_optional_args = {
+                k: optional_args.get(k, v)
+                for k, v in netmiko_argument_map.items()
+            }
+
             self.port = optional_args.get('port', 22)
             self.sudo_pwd = optional_args.get('sudo_pwd', self.password)
 
@@ -240,7 +236,7 @@ class NXOSDriver(NetworkDriver):
         if self.ssh_connection:
             command += ' | json'
             try:
-                json_output = json.loads(self.device.send_command_timing(command))
+                json_output = json.loads(self.device.send_command(command))
             except ValueError:
                 return {}
         else:
@@ -259,9 +255,6 @@ class NXOSDriver(NetworkDriver):
                 return {'is_alive': False}
 
     def load_replace_candidate(self, filename=None, config=None):
-        self.replace = True
-        self.loaded = True
-
         if not filename and not config:
             raise ReplaceConfigException('filename or config param must be provided.')
 
@@ -300,7 +293,7 @@ class NXOSDriver(NetworkDriver):
         else:
             self.merge_candidate += config
 
-    def _send_file(self, filename, dest):
+    def _send_file_api(self, filename, dest):
         self.fc = FileCopy(self.device, filename, dst=dest.split('/')[-1])
         try:
             if not self.fc.remote_file_exists():
@@ -309,6 +302,74 @@ class NXOSDriver(NetworkDriver):
                 self.fc.send()
         except NXOSFileTransferError as fte:
             raise ReplaceConfigException(fte.message)
+
+    def _load_candidate_wrapper(self, source_file=None, dest_file=None,
+                                file_system=None):
+        """
+        Transfer file to remote device for either merge or replace operations
+        Returns (return_status, msg)
+        """
+        return_status = False
+        msg = ''
+
+        (return_status, msg) = self._scp_file(source_file=source_file, dest_file=dest_file,
+                                              file_system=file_system)
+        if not return_status:
+            if msg == '':
+                msg = "Transfer to remote device failed"
+        return (return_status, msg)
+
+    def _scp_file(self, source_file, dest_file, file_system):
+        return self._xfer_file(source_file=source_file, dest_file=dest_file,
+                               file_system=file_system, TransferClass=FileTransfer)
+
+    def _xfer_file(self, source_file=None, dest_file=None, file_system=None,
+                   TransferClass=FileTransfer):
+
+        kwargs = dict(ssh_conn=self.device, source_file=source_file, dest_file=dest_file,
+                      direction='put', file_system=file_system)
+        print ("EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEe", file_system)
+        enable_scp = True
+        with TransferClass(**kwargs) as transfer:
+
+            # Check if file already exists and has correct MD5
+            if transfer.check_file_exists() and transfer.compare_md5():
+                msg = "File already exists and has correct MD5: no SCP needed"
+                return (True, msg)
+            if not transfer.verify_space_available():
+                msg = "Insufficient space available on remote device"
+                return (False, msg)
+
+            if enable_scp:
+                transfer.enable_scp()
+
+            # Transfer file
+            transfer.transfer_file()
+
+            # Compares MD5 between local-remote files
+            if transfer.verify_file():
+                msg = "File successfully transferred to remote device"
+                return (True, msg)
+            else:
+                msg = "File transfer to remote device failed"
+                return (False, msg)
+            return (False, '')
+
+    def _send_file_ssh(self, filename, dest):
+        self.config_replace = True
+        return_status, msg = self._load_candidate_wrapper(source_file=filename,
+                                                          dest_file='candidate_config.txt',
+                                                          file_system='bootflash:')
+        if not return_status:
+            raise ReplaceConfigException(msg)
+
+    def _send_file(self, filename, dest):
+        if self.ssh_connection:
+            self._send_file_ssh(filename, dest)
+        else:
+            self._send_file_api(filename, dest)
+        self.replace = True
+        self.loaded = True
 
     def _create_sot_file(self):
         """Create Source of Truth file to compare."""
@@ -362,15 +423,29 @@ class NXOSDriver(NetworkDriver):
             return diff
         return ''
 
+    def _save_ssh(self, filename='startup-config'):
+        output = self.device.send_command('copy run %s' % filename)
+        if 'complete' in output.lower():
+            return True
+        return False
+
     def _commit_merge(self):
         commands = [command for command in self.merge_candidate.splitlines() if command]
-        self.device.config_list(commands)
-        if not self.device.save():
-            raise CommandErrorException('Unable to commit config!')
+        if self.ssh_connection:
+            self.device.send_config_set(commands)
+            if not self._save_ssh():
+                raise CommandErrorException('Unable to commit config!')
+        else:
+            self.device.config_list(commands)
+            if not self.device.save():
+                raise CommandErrorException('Unable to commit config!')
 
     def _save_config(self, filename):
         """Save the current running config to the given file."""
-        self.device.show('checkpoint file {}'.format(filename), raw_text=True)
+        if self.ssh_connection:
+            self.device.send_command('checkpoint file {}'.format(filename))
+        else:
+            self.device.show('checkpoint file {}'.format(filename), raw_text=True)
 
     def _disable_confirmation(self):
         self.device.config('terminal dont-ask')
@@ -407,18 +482,13 @@ class NXOSDriver(NetworkDriver):
             raise ReplaceConfigException('No config loaded.')
 
     def _delete_file(self, filename):
-        self.device.show('terminal dont-ask', raw_text=True)
-        self.device.show('delete {}'.format(filename), raw_text=True)
-        self.device.show('no terminal dont-ask', raw_text=True)
-
-    def _delete_file_ssh(self, filename):
-        commands_list = [
+        commands = [
             'terminal dont-ask',
             'delete {}'.format(filename),
             'no terminal dont-ask'
         ]
-        for command in commands_list:
-            self.device.send_command(command)
+        for command in commands:
+            self._send_command(command, fmt='text')
 
     def discard_config(self):
         if self.loaded:
@@ -430,10 +500,19 @@ class NXOSDriver(NetworkDriver):
                 pass
         self.loaded = False
 
+    def _rollback_ssh(self, backup_file):
+        result = self.device.send_command('rollback running-config file %s' % backup_file)
+        if 'completed' not in result.lower():
+            raise ReplaceConfigException(result)
+        self._save_ssh()
+
     def rollback(self):
         if self.changed:
-            self.device.rollback(self.backup_file)
-            self.device.save()
+            if self.ssh_connection:
+                self._rollback_ssh(self.backup_file)
+            else:
+                self.device.rollback(self.backup_file)
+                self.device.save()
             self.changed = False
 
     def _apply_key_map(self, key_map, table):
@@ -451,50 +530,57 @@ class NXOSDriver(NetworkDriver):
         seconds += int(uptime_facts['up_secs'])
         return seconds
 
-    def get_facts(self):
+    def _get_facts_ssh(self):
         final_facts = {}
-        if self.ssh_connection:
-            show_ver_output = json.loads(self.device.send_command_timing('show version | json'))
-            uptime_facts = self._apply_key_map(UPTIME_KEY_MAP, show_ver_output)
-            final_facts['uptime'] = self._convert_uptime_to_seconds(uptime_facts)
-            final_facts['os_version'] = show_ver_output.get('kickstart_ver_str')
-            final_facts['serial_number'] = show_ver_output.get('proc_board_id')
-            final_facts['model'] = show_ver_output.get('chassis_id')
-            final_facts['serial_number'] = show_ver_output.get('proc_board_id')
-            final_facts['hostname'] = show_ver_output.get('host_name')
+        show_ver_output = json.loads(self.device.send_command_timing('show version | json'))
+        uptime_facts = self._apply_key_map(UPTIME_KEY_MAP, show_ver_output)
+        final_facts['uptime'] = self._convert_uptime_to_seconds(uptime_facts)
+        final_facts['os_version'] = show_ver_output.get('kickstart_ver_str')
+        final_facts['serial_number'] = show_ver_output.get('proc_board_id')
+        final_facts['model'] = show_ver_output.get('chassis_id')
+        final_facts['serial_number'] = show_ver_output.get('proc_board_id')
+        final_facts['hostname'] = show_ver_output.get('host_name')
 
-            interfaces_output = self.device.send_command_timing('show interface status | json')
-            interface_list = json.loads(interfaces_output)['TABLE_interface']['ROW_interface']
-            interfaces = [intf['interface'] for intf in interface_list]
-            final_facts['interface_list'] = interfaces
+        final_facts['fqdn'] = json.loads(self.device.send_command(
+                                'show hostname | json')).get('hostname')
+        interfaces_output = self.device.send_command_timing('show interface status | json')
+        interface_list = json.loads(interfaces_output)['TABLE_interface']['ROW_interface']
+        interfaces = [intf['interface'] for intf in interface_list]
+        final_facts['interface_list'] = interfaces
+        final_facts['vendor'] = 'Cisco'
+        return final_facts
+
+    def _get_facts_api(self):
+        pynxos_facts = self.device.facts
+        final_facts = {key: value for key, value in pynxos_facts.items() if
+                       key not in ['interfaces', 'uptime_string', 'vlans']}
+
+        if pynxos_facts['interfaces']:
+            final_facts['interface_list'] = pynxos_facts['interfaces']
         else:
-            pynxos_facts = self.device.facts
-            final_facts = {key: value for key, value in pynxos_facts.items() if
-                           key not in ['interfaces', 'uptime_string', 'vlans']}
+            final_facts['interface_list'] = self.get_interfaces().keys()
 
-            if pynxos_facts['interfaces']:
-                final_facts['interface_list'] = pynxos_facts['interfaces']
-            else:
-                final_facts['interface_list'] = self.get_interfaces().keys()
-
-            hostname_cmd = 'show hostname'
-            hostname = self.device.show(hostname_cmd).get('hostname')
+        hostname_cmd = 'show hostname'
+        hostname = self.device.show(hostname_cmd).get('hostname')
 
         final_facts['vendor'] = 'Cisco'
         if hostname:
             final_facts['fqdn'] = hostname
-
         return final_facts
+
+    def _facts(self):
+        if self.ssh_connection:
+            return self._get_facts_ssh()
+        else:
+            return self._get_facts_api()
+
+    def get_facts(self):
+        return self._facts()
 
     def get_interfaces(self):
         interfaces = {}
-        iface_cmd = 'show interface'
-        if self.ssh_connection:
-            iface_cmd += ' | json'
-            interfaces_out = json.loads(self.device.send_command_timing(iface_cmd))
-        else:
-            interfaces_out = self.device.show(iface_cmd)
-        interfaces_body = interfaces_out['TABLE_interface']['ROW_interface']
+        cmd = 'show interface'
+        interfaces_body = self._get_command_table(cmd, 'TABLE_interface', 'ROW_interface')
 
         for interface_details in interfaces_body:
             interface_name = interface_details.get('interface')
@@ -521,16 +607,9 @@ class NXOSDriver(NetworkDriver):
 
     def get_lldp_neighbors(self):
         results = {}
-        try:
-            command = 'show lldp neighbors'
-            if self.ssh_connection:
-                lldp_raw_output = self.device.send_command_timing(command)
-            else:
-                lldp_raw_output = self.cli([command]).get(command, '')
-            lldp_neighbors = napalm_base.helpers.textfsm_extractor(
-                                self, 'lldp_neighbors', lldp_raw_output)
-        except CLIError:
-            lldp_neighbors = []
+        lldp_raw_output = self._send_command('show lldp neighbors', fmt='text')
+        lldp_neighbors = napalm_base.helpers.textfsm_extractor(
+                            self, 'lldp_neighbors', lldp_raw_output)
 
         for neighbor in lldp_neighbors:
             local_iface = neighbor.get('local_interface')
@@ -547,11 +626,8 @@ class NXOSDriver(NetworkDriver):
 
     def get_bgp_neighbors(self):
         results = {}
-        try:
-            cmd = 'show bgp sessions vrf all'
-            vrf_list = self._get_command_table(cmd, 'TABLE_vrf', 'ROW_vrf')
-        except CLIError:
-            vrf_list = []
+        cmd = 'show bgp sessions vrf all'
+        vrf_list = self._get_command_table(cmd, 'TABLE_vrf', 'ROW_vrf')
 
         for vrf_dict in vrf_list:
             result_vrf_dict = {}
@@ -589,23 +665,22 @@ class NXOSDriver(NetworkDriver):
             results[vrf_name] = result_vrf_dict
         return results
 
-    def _set_checkpoint(self, filename):
-        commands = ['terminal dont-ask', 'checkpoint file {0}'.format(filename)]
+    def _send_config_commands(self, commands):
         if self.ssh_connection:
             for command in commands:
                 self.device.send_command(command)
         else:
             self.device.config_list(commands)
 
+    def _set_checkpoint(self, filename):
+        commands = ['terminal dont-ask', 'checkpoint file {0}'.format(filename)]
+        self._send_config_commands(commands)
+
     def _get_checkpoint_file(self):
         filename = 'temp_cp_file_from_napalm'
         self._set_checkpoint(filename)
-        if self.ssh_connection:
-            cp_out = self.device.send_command_timing('show file {0}'.format(filename))
-            self._delete_file_ssh(filename)
-        else:
-            cp_out = self.device.show('show file {0}'.format(filename), raw_text=True)
-            self._delete_file(filename)
+        cp_out = self._send_command('show file {0}'.format(filename), fmt='text')
+        self._delete_file(filename)
         return cp_out
 
     def get_lldp_neighbors_detail(self, interface=''):
@@ -617,15 +692,9 @@ class NXOSDriver(NetworkDriver):
         command = 'show lldp neighbors {filter}detail'.format(filter=filter)
         # seems that some old devices may not return JSON output...
 
-        try:
-            if self.ssh_connection:
-                lldp_neighbors_table_str = self.device.send_command_timing(command)
-            else:
-                lldp_neighbors_table_str = self.cli([command]).get(command)
-            # thus we need to take the raw text output
-            lldp_neighbors_list = lldp_neighbors_table_str.splitlines()
-        except CLIError:
-            lldp_neighbors_list = []
+        lldp_neighbors_table_str = self._send_command(command, fmt='text')
+        # thus we need to take the raw text output
+        lldp_neighbors_list = lldp_neighbors_table_str.splitlines()
 
         if not lldp_neighbors_list:
             return lldp_neighbors  # empty dict
@@ -699,12 +768,26 @@ class NXOSDriver(NetworkDriver):
             raise TypeError('Please enter a valid list of commands!')
 
         for command in commands:
-            if self.ssh_connection:
-                command_output = self.device.send_command_timing(command)
-            else:
-                command_output = self.device.show(command, raw_text=True)
+            command_output = self._send_command(command, fmt='text')
             cli_output[py23_compat.text_type(command)] = command_output
         return cli_output
+
+    def _send_command(self, command, fmt='json'):
+        if self.ssh_connection:
+            if fmt == 'json':
+                command += ' | json'
+                output = json.loads(self.device.send_command(command))
+            else:
+                output = self.device.send_command(command)
+        else:
+            try:
+                if fmt == 'json':
+                    output = self.device.show(command)
+                else:
+                    output = self.device.show(command, raw_text=True)
+            except CLIError:
+                output = ""
+        return output
 
     def get_arp_table(self):
         arp_table = []
@@ -876,10 +959,7 @@ class NXOSDriver(NetworkDriver):
     def get_snmp_information(self):
         snmp_information = {}
         snmp_command = 'show running-config'
-        if self.ssh_connection:
-            snmp_raw_output = self.device.send_command_timing(snmp_command)
-        else:
-            snmp_raw_output = self.cli([snmp_command]).get(snmp_command, '')
+        snmp_raw_output = self._send_command(snmp_command, fmt='text')
         snmp_config = napalm_base.helpers.textfsm_extractor(self, 'snmp_config', snmp_raw_output)
 
         if not snmp_config:
@@ -932,10 +1012,7 @@ class NXOSDriver(NetworkDriver):
 
         users = {}
         command = 'show running-config'
-        if self.ssh_connection:
-            section_username_raw_output = self.device.send_command_timing(command)
-        else:
-            section_username_raw_output = self.cli([command]).get(command, '')
+        section_username_raw_output = self._send_command(command, fmt='text')
         section_username_tabled_output = napalm_base.helpers.textfsm_extractor(
             self, 'users', section_username_raw_output)
 
@@ -1018,10 +1095,7 @@ class NXOSDriver(NetworkDriver):
         )
 
         try:
-            if self.ssh_connection:
-                traceroute_raw_output = self.device.send_command_timing(command)
-            else:
-                traceroute_raw_output = self.cli([command]).get(command)
+            traceroute_raw_output = self._send_command(command, fmt='text')
         except CommandErrorException:
             return {'error': 'Cannot execute traceroute on the device: {}'.format(command)}
 
@@ -1072,14 +1146,8 @@ class NXOSDriver(NetworkDriver):
 
         if retrieve.lower() in ('running', 'all'):
             _cmd = 'show running-config'
-            if self.ssh_connection:
-                config['running'] = py23_compat.text_type(self.device.send_command_timing(_cmd))
-            else:
-                config['running'] = py23_compat.text_type(self.cli([_cmd]).get(_cmd))
+            config['running'] = py23_compat.text_type(self._send_command(_cmd, fmt='text'))
         if retrieve.lower() in ('startup', 'all'):
             _cmd = 'show startup-config'
-            if self.ssh_connection:
-                config['startup'] = py23_compat.text_type(self.device.send_command_timing(_cmd))
-            else:
-                config['startup'] = py23_compat.text_type(self.cli([_cmd]).get(_cmd))
+            config['startup'] = py23_compat.text_type(self._send_command(_cmd, fmt='text'))
         return config
