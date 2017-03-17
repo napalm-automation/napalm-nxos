@@ -17,11 +17,15 @@ from __future__ import unicode_literals
 
 # import stdlib
 import re
+import os
 import json
 import time
+import uuid
 import tempfile
+from scp import SCPClient
+import paramiko
+import hashlib
 from datetime import datetime
-from distutils.version import LooseVersion
 from requests.exceptions import ConnectionError
 
 # import third party lib
@@ -33,8 +37,7 @@ from pynxos.features.file_copy import FileTransferError as NXOSFileTransferError
 from pynxos.features.file_copy import FileCopy
 from pynxos.errors import CLIError
 
-from netmiko import ConnectHandler, FileTransfer
-from netmiko import __version__ as netmiko_version
+from netmiko import ConnectHandler
 from netmiko.ssh_exception import NetMikoTimeoutException
 
 # import NAPALM Base
@@ -95,11 +98,8 @@ class NXOSDriver(NetworkDriver):
                 'alt_host_keys': False,
                 'alt_key_file': '',
                 'ssh_config_file': None,
+                'allow_agent': False
             }
-
-            if (LooseVersion(netmiko_version) >= LooseVersion('2.0.0') or
-                    LooseVersion(netmiko_version) >= LooseVersion('1.1.0')):
-                netmiko_argument_map['allow_agent'] = False
 
             # Build dict of any optional Netmiko args
             self.netmiko_optional_args = {
@@ -118,6 +118,7 @@ class NXOSDriver(NetworkDriver):
                                          password=self.password,
                                          **self.netmiko_optional_args)
             self.ssh_connection = True
+            self.device.enable()
         except NetMikoTimeoutException:
             raise ConnectionException('Cannot connect to {}'.format(self.hostname))
 
@@ -255,6 +256,106 @@ class NXOSDriver(NetworkDriver):
                 return {'is_alive': False}
 
     def load_replace_candidate(self, filename=None, config=None):
+        if self.ssh_connection:
+            self._replace_candidate_ssh(filename, config)
+        else:
+            self._replace_candidate(filename, config)
+        self.replace = True
+        self.loaded = True
+
+    def _get_flash_size(self):
+        command = 'dir {}'.format('bootflash:')
+        output = self.device.send_command(command)
+
+        match = re.search(r'(\d+) bytes free', output)
+        bytes_free = match.group(1)
+
+        return int(bytes_free)
+
+    def _enough_space(self, filename):
+        flash_size = self._get_flash_size()
+        file_size = os.path.getsize(filename)
+        if file_size > flash_size:
+            return False
+        return True
+
+    def _verify_remote_file_exists(self, dst, file_system='bootflash:'):
+        command = 'dir {0}/{1}'.format(file_system, dst)
+        response = self.device.send_command(command)
+        if 'No such file' in response:
+            raise ReplaceConfigException('Could not transfer file.')
+
+    def _replace_candidate_ssh(self, filename, config):
+        if not filename:
+            file_content = self.fix_checkpoint_string(config, self.replace_file)
+            filename = self._create_tmp_file(config)
+        else:
+            if not os.path.isfile(filename):
+                raise ReplaceConfigException("File {} not found".format(filename))
+
+        self.replace_file = filename
+        with open(self.replace_file, 'r+') as f:
+            file_content = f.read()
+            file_content = self.fix_checkpoint_string(file_content, self.replace_file)
+            f.write(file_content)
+
+        if not self._enough_space(self.replace_file):
+            msg = 'Could not transfer file. Not enough space on device.'
+            raise ReplaceConfigException(msg)
+
+        self._check_file_exists(self.replace_file)
+        dest = os.path.basename(self.replace_file)
+        full_remote_path = 'bootflash:{}'.format(dest)
+        with paramiko.SSHClient() as ssh:
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh.connect(hostname=self.hostname, username=self.username, password=self.password)
+
+            try:
+                with SCPClient(ssh.get_transport()) as scp_client:
+                    scp_client.put(self.replace_file, full_remote_path)
+            except:
+                time.sleep(10)
+                file_size = os.path.getsize(filename)
+                temp_size = self._verify_remote_file_exists(dest)
+                if int(temp_size) != int(file_size):
+                    msg = ('Could not transfer file. There was an error '
+                           'during transfer. Please make sure remote '
+                           'permissions are set.')
+                raise ReplaceConfigException(msg)
+        self.config_replace = True
+        if config and os.path.isfile(self.replace_file):
+            os.remove(self.replace_file)
+
+    def _file_already_exists(self, dst):
+        dst_hash = self._get_remote_md5(dst)
+        src_hash = self._get_local_md5(dst)
+        if src_hash == dst_hash:
+            return True
+        return False
+
+    def _check_file_exists(self, cfg_file):
+        cmd = 'dir {}'.format(cfg_file)
+        output = self.device.send_command(cmd)
+        if 'No such file' in output:
+            return False
+        else:
+            return self._file_already_exists(cfg_file)
+
+    def _get_remote_md5(self, dst):
+        command = 'show file {0} md5sum'.format(dst)
+        return self.device.send_command(command).strip()
+
+    def _get_local_md5(self, dst, blocksize=2**20):
+        md5 = hashlib.md5()
+        local_file = open(dst, 'rb')
+        buf = local_file.read(blocksize)
+        while buf:
+            md5.update(buf)
+            buf = local_file.read(blocksize)
+        local_file.close()
+        return md5.hexdigest()
+
+    def _replace_candidate(self, filename, config):
         if not filename and not config:
             raise ReplaceConfigException('filename or config param must be provided.')
 
@@ -277,7 +378,7 @@ class NXOSDriver(NetworkDriver):
         temp_file.flush()
         self.replace_file = cfg_filename
 
-        self._send_file(temp_file.name, cfg_filename)
+        self._send_file_api(temp_file.name, cfg_filename)
 
     def load_merge_candidate(self, filename=None, config=None):
         self.replace = False
@@ -303,85 +404,27 @@ class NXOSDriver(NetworkDriver):
         except NXOSFileTransferError as fte:
             raise ReplaceConfigException(fte.message)
 
-    def _load_candidate_wrapper(self, source_file=None, dest_file=None,
-                                file_system=None):
-        """
-        Transfer file to remote device for either merge or replace operations
-        Returns (return_status, msg)
-        """
-        return_status = False
-        msg = ''
-
-        (return_status, msg) = self._scp_file(source_file=source_file, dest_file=dest_file,
-                                              file_system=file_system)
-        if not return_status:
-            if msg == '':
-                msg = "Transfer to remote device failed"
-        return (return_status, msg)
-
-    def _scp_file(self, source_file, dest_file, file_system):
-        return self._xfer_file(source_file=source_file, dest_file=dest_file,
-                               file_system=file_system, TransferClass=FileTransfer)
-
-    def _xfer_file(self, source_file=None, dest_file=None, file_system=None,
-                   TransferClass=FileTransfer):
-
-        kwargs = dict(ssh_conn=self.device, source_file=source_file, dest_file=dest_file,
-                      direction='put', file_system=file_system)
-        enable_scp = True
-        with TransferClass(**kwargs) as transfer:
-
-            # Check if file already exists and has correct MD5
-            if transfer.check_file_exists() and transfer.compare_md5():
-                msg = "File already exists and has correct MD5: no SCP needed"
-                return (True, msg)
-            if not transfer.verify_space_available():
-                msg = "Insufficient space available on remote device"
-                return (False, msg)
-
-            if enable_scp:
-                transfer.enable_scp()
-
-            # Transfer file
-            transfer.transfer_file()
-
-            # Compares MD5 between local-remote files
-            if transfer.verify_file():
-                msg = "File successfully transferred to remote device"
-                return (True, msg)
-            else:
-                msg = "File transfer to remote device failed"
-                return (False, msg)
-            return (False, '')
-
-    def _send_file_ssh(self, filename, dest):
-        self.config_replace = True
-        return_status, msg = self._load_candidate_wrapper(source_file=filename,
-                                                          dest_file='candidate_config.txt',
-                                                          file_system='bootflash:')
-        if not return_status:
-            raise ReplaceConfigException(msg)
-
-    def _send_file(self, filename, dest):
-        if self.ssh_connection:
-            self._send_file_ssh(filename, dest)
-        else:
-            self._send_file_api(filename, dest)
-        self.replace = True
-        self.loaded = True
+    @staticmethod
+    def _create_tmp_file(config):
+        tmp_dir = tempfile.gettempdir()
+        rand_fname = py23_compat.text_type(uuid.uuid4())
+        filename = os.path.join(tmp_dir, rand_fname)
+        with open(filename, 'wt') as fobj:
+            fobj.write(config)
+        return filename
 
     def _create_sot_file(self):
         """Create Source of Truth file to compare."""
         commands = ['terminal dont-ask', 'checkpoint file sot_file']
-        self.device.config_list(commands)
+        self._send_config_commands(commands)
 
-    def _get_diff(self, cp_file):
+    def _get_diff(self):
         """Get a diff between running config and a proposed file."""
         diff = []
         self._create_sot_file()
-        diff_out = self.device.show(
-            'show diff rollback-patch file {0} file {1}'.format(
-                'sot_file', self.replace_file.split('/')[-1]), raw_text=True)
+        command = ('show diff rollback-patch file {0} file {1}'.format(
+                   'sot_file', self.replace_file.split('/')[-1]))
+        diff_out = self._send_command(command, fmt='text')
         try:
             diff_out = diff_out.split(
                 '#Generating Rollback Patch')[1].replace(
@@ -418,7 +461,7 @@ class NXOSDriver(NetworkDriver):
             if not self.replace:
                 return self._get_merge_diff()
                 # return self.merge_candidate
-            diff = self._get_diff(self.fc.dst)
+            diff = self._get_diff()
             return diff
         return ''
 
@@ -447,17 +490,13 @@ class NXOSDriver(NetworkDriver):
             self.device.show('checkpoint file {}'.format(filename), raw_text=True)
 
     def _disable_confirmation(self):
-        self.device.config('terminal dont-ask')
+        self._send_config_commands(['terminal dont-ask'])
 
     def _load_config(self):
         cmd = 'rollback running file {0}'.format(self.replace_file.split('/')[-1])
         self._disable_confirmation()
-        try:
-            self.device.config(cmd)
-        except ConnectionError:
-            # requests will raise an error with verbose warning output
-            return True
-        except Exception:
+        response = self._send_command(cmd, fmt='text')
+        if 'Rollback failed' in response or response == []:
             return False
         return True
 
@@ -567,14 +606,11 @@ class NXOSDriver(NetworkDriver):
             final_facts['fqdn'] = hostname
         return final_facts
 
-    def _facts(self):
+    def get_facts(self):
         if self.ssh_connection:
             return self._get_facts_ssh()
         else:
             return self._get_facts_api()
-
-    def get_facts(self):
-        return self._facts()
 
     def get_interfaces(self):
         interfaces = {}
@@ -598,7 +634,7 @@ class NXOSDriver(NetworkDriver):
                 'description': py23_compat.text_type(interface_details.get('desc', '').strip('"')),
                 'last_flapped': self._compute_timestamp(
                     interface_details.get('eth_link_flapped', '')),
-                'speed': interface_speed,
+                'speed': int(interface_speed),
                 'mac_address': napalm_base.helpers.convert(
                     napalm_base.helpers.mac, interface_details.get('eth_hw_addr')),
             }
@@ -785,7 +821,9 @@ class NXOSDriver(NetworkDriver):
                 else:
                     output = self.device.show(command, raw_text=True)
             except CLIError:
-                output = ""
+                output = []
+            except ConnectionError:
+                output = []
         return output
 
     def get_arp_table(self):
