@@ -313,7 +313,7 @@ class NXOSDriver(NetworkDriver):
             try:
                 with SCPClient(ssh.get_transport()) as scp_client:
                     scp_client.put(self.replace_file, full_remote_path)
-            except:
+            except Exception:
                 time.sleep(10)
                 file_size = os.path.getsize(filename)
                 temp_size = self._verify_remote_file_exists(dest)
