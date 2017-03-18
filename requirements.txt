@@ -3,4 +3,4 @@ pynxos
 netaddr
 future
 scp
-netmiko
+netmiko>=1.1.0
