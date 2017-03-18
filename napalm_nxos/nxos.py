@@ -474,7 +474,9 @@ class NXOSDriver(NetworkDriver):
     def _commit_merge(self):
         commands = [command for command in self.merge_candidate.splitlines() if command]
         if self.ssh_connection:
-            self.device.send_config_set(commands)
+            output = self.device.send_config_set(commands)
+            if 'Invalid command' in output:
+                raise MergeConfigException('Error while applying config!')
             if not self._save_ssh():
                 raise CommandErrorException('Unable to commit config!')
         else:
@@ -533,7 +535,7 @@ class NXOSDriver(NetworkDriver):
             self.merge_candidate = ''  # clear the buffer
         if self.loaded and self.replace:
             try:
-                self._delete_file(self.fc.dst)
+                self._delete_file(self.replace_file)
             except CLIError:
                 pass
         self.loaded = False
