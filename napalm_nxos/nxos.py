@@ -97,6 +97,16 @@ class NXOSDriver(NetworkDriver):
         if not stupid_cisco_output or stupid_cisco_output == 'never':
             return -1.0
 
+        if '(s)' in stupid_cisco_output:
+            pass
+        elif ':' in stupid_cisco_output:
+            stupid_cisco_output = stupid_cisco_output.replace(':', 'hour(s) ', 1)
+            stupid_cisco_output = stupid_cisco_output.replace(':', 'minute(s) ', 1)
+            stupid_cisco_output += 'second(s)'
+        else:
+            stupid_cisco_output = stupid_cisco_output.replace('d', 'day(s) ')
+            stupid_cisco_output = stupid_cisco_output.replace('h', 'hour(s)')
+
         things = {
             'second(s)': {
                 'weight': 1
@@ -226,6 +236,9 @@ class NXOSDriver(NetworkDriver):
             if not self.fc.remote_file_exists():
                 self.fc.send()
             elif not self.fc.file_already_exists():
+                commands = ['terminal dont-ask',
+                            'delete {0}'.format(self.fc.dst)]
+                self.device.config_list(commands)
                 self.fc.send()
         except NXOSFileTransferError as fte:
             raise ReplaceConfigException(fte.message)
@@ -329,9 +342,10 @@ class NXOSDriver(NetworkDriver):
             raise ReplaceConfigException('No config loaded.')
 
     def _delete_file(self, filename):
-        self.device.show('terminal dont-ask', raw_text=True)
-        self.device.show('delete {}'.format(filename), raw_text=True)
-        self.device.show('no terminal dont-ask', raw_text=True)
+        commands = ['terminal dont-ask',
+                    'delete {}'.format(filename),
+                    'no terminal dont-ask']
+        self.device.show_list(commands, raw_text=True)
 
     def discard_config(self):
         if self.loaded:
@@ -439,10 +453,11 @@ class NXOSDriver(NetworkDriver):
 
             for neighbor_dict in neighbors_list:
                 neighborid = napalm_base.helpers.ip(neighbor_dict['neighbor-id'])
+                remoteas = napalm_base.helpers.as_number(neighbor_dict['remoteas'])
 
                 result_peer_dict = {
                     'local_as': int(vrf_dict['local-as']),
-                    'remote_as': int(neighbor_dict['remoteas']),
+                    'remote_as': remoteas,
                     'remote_id': neighborid,
                     'is_enabled': True,
                     'uptime': -1,
