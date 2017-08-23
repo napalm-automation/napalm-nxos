@@ -1,0 +1,74 @@
+{
+  "Ethernet1/1": {
+    "is_enabled": true,
+    "description": "FEX51 Po member",
+    "last_flapped": -1,
+    "is_up": true,
+    "mac_address": "54:7F:EE:A2:4B:88",
+    "speed": 10000
+  },
+  "Ethernet1/2": {
+    "is_enabled": true,
+    "description": "",
+    "last_flapped": -1,
+    "is_up": false,
+    "mac_address": "54:7F:EE:A2:4B:C1",
+    "speed": 10000
+  },
+  "Ethernet1/3": {
+    "is_enabled": true,
+    "description": "FEX52 Po member",
+    "last_flapped": -1,
+    "is_up": true,
+    "mac_address": "54:7F:EE:A2:4B:89",
+    "speed": 10000
+  },
+  "Ethernet1/4": {
+    "is_enabled": true,
+    "description": "",
+    "last_flapped": -1,
+    "is_up": false,
+    "mac_address": "54:7F:EE:A2:4B:C1",
+    "speed": 10000
+  },
+  "Ethernet1/7": {
+    "is_enabled": true,
+    "description": "foo.bar.server70",
+    "last_flapped": -1,
+    "is_up": true,
+    "mac_address": "54:7F:EE:A2:4B:A7",
+    "speed": 1000
+  },
+  "Ethernet1/8": {
+    "is_enabled": true,
+    "description": "AMDC-PROD-RS01 T2/2/5",
+    "last_flapped": -1,
+    "is_up": true,
+    "mac_address": "54:7F:EE:A2:4B:A1",
+    "speed": 10000
+  },
+  "port-channel28": {
+    "is_enabled": true,
+    "description": "foo.bar.server0",
+    "last_flapped": -1,
+    "is_up": true,
+    "mac_address": "54:7F:EE:A2:4B:A1",
+    "speed": 10000
+  },
+  "port-channel52": {
+    "is_enabled": true,
+    "description": "FEX52",
+    "last_flapped": -1,
+    "is_up": true,
+    "mac_address": "54:7F:EE:A2:4B:8A",
+    "speed": 10000
+  },
+  "port-channel51": {
+    "is_enabled": true,
+    "description": "FEX51",
+    "last_flapped": -1,
+    "is_up": true,
+    "mac_address": "54:7F:EE:A2:4B:88",
+    "speed": 10000
+  }
+}
