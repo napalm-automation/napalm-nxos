@@ -709,10 +709,114 @@ class NXOSSSHDriver(NetworkDriver):
         }
 
     def get_interfaces(self):
+        """
+        Get interface details.
+        last_flapped is not implemented
+        Example Output:
+        {   u'Vlan1': {   'description': u'N/A',
+                      'is_enabled': True,
+                      'is_up': True,
+                      'last_flapped': -1.0,
+                      'mac_address': u'a493.4cc1.67a7',
+                      'speed': 100},
+        u'Vlan100': {   'description': u'Data Network',
+                        'is_enabled': True,
+                        'is_up': True,
+                        'last_flapped': -1.0,
+                        'mac_address': u'a493.4cc1.67a7',
+                        'speed': 100},
+        u'Vlan200': {   'description': u'Voice Network',
+                        'is_enabled': True,
+                        'is_up': True,
+                        'last_flapped': -1.0,
+                        'mac_address': u'a493.4cc1.67a7',
+                        'speed': 100}}
+        """
+        # default values.
+        last_flapped = -1.0
         interfaces = {}
         command = 'show interface'
-        output = self.device.send_command(command) # noqa
-        return interfaces
+        output = self.device.send_command(command)
+
+        interface = description = mac_address = speed = speedformat = ''
+        is_enabled = is_up = one_off = None
+
+        interface_dict = {}
+        interface_regex_proto = r"^(\S+?)\s+is\s+(up|down).+line protocol is (\S+)"
+        interface_regex_admin = r"^(\S+?)\s+is\s+(up|down)\s+\(Administratively down\)\s.$"
+        interface_regex = r"^(\S+?)\s+is\s+(up|down)(\s|$)"
+        admin_regex = r"^admin\s+state\s+is\s+(up|down)(,|\s|$)"
+        mac_addr_regex = r"^\s+Hardware:.+address:\s+({})".format(MAC_REGEX)
+        descr_regex = r"^\s+Description:\s+(.+?)$"
+        speed_regex = r"^\s+MTU\s+\d+.+BW\s+(\d+)\s+([KMG]?b)it,\s+DLY"
+        for line in output.splitlines():
+
+            if re.search(interface_regex_proto, line):
+                interface_match = re.search(interface_regex_proto, line)
+                interface = interface_match.groups()[0]
+                protocol = interface_match.groups()[1]
+                status = interface_match.groups()[2]
+                is_up = bool('up' in protocol)
+                is_enabled = bool('up' in status)
+            elif re.search(interface_regex_admin, line):
+                interface_match = re.search(interface_regex_admin, line)
+                interface = interface_match.groups()[0]
+                protocol = interface_match.groups()[1]
+                is_up = bool('up' in protocol)
+                is_enabled = False
+            elif re.search(interface_regex, line):
+                interface_match = re.search(interface_regex, line)
+                interface = interface_match.groups()[0]
+                protocol = interface_match.groups()[1]
+                is_up = bool('up' in protocol)
+            elif re.search(admin_regex, line):
+                admin_match = re.search(admin_regex, line)
+                status = admin_match.groups()[0]
+                is_enabled = bool('up' in status)
+
+            elif re.search(mac_addr_regex, line):
+                mac_addr_match = re.search(mac_addr_regex, line)
+                mac_address = napalm_base.helpers.mac(mac_addr_match.groups()[0])
+
+            elif re.search(descr_regex, line):
+                descr_match = re.search(descr_regex, line)
+                description = descr_match.groups()[0]
+
+            if "down (L3 not ready)" in line:
+                one_off = True
+
+            if re.search(speed_regex, line):
+                speed_match = re.search(speed_regex, line)
+                speed = speed_match.groups()[0]
+                speedformat = speed_match.groups()[1]
+                speed = float(speed)
+                if speedformat.startswith('Kb'):
+                    speed = speed / 1000.0
+                elif speedformat.startswith('Gb'):
+                    speed = speed * 1000
+                speed = int(round(speed))
+
+                if not isinstance(is_enabled, bool):
+                    if one_off is False or one_off is True:
+                        is_enabled = one_off
+                    elif is_up is False:
+                        raise ValueError("Admin state was not found, but interface \
+                                          was up, error expected {}".format(interface))
+                    else:
+                        is_enabled = True
+                if interface == '':
+                    raise ValueError("Interface attributes were \
+                                      found without any known interface")
+                if not isinstance(is_up, bool) or not isinstance(is_enabled, bool):
+                    raise ValueError("Did not correctly find the interface status")
+
+                interface_dict[interface] = {'is_enabled': is_enabled, 'is_up': is_up,
+                                             'description': description, 'mac_address': mac_address,
+                                             'last_flapped': last_flapped, 'speed': speed}
+
+                interface = description = mac_address = speed = speedformat = ''
+                is_enabled = is_up = one_off = None
+        return interface_dict
 
     def get_lldp_neighbors(self):
         results = {}
