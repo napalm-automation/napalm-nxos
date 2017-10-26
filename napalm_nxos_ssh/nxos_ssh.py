@@ -456,16 +456,6 @@ class NXOSSSHDriver(NetworkDriver):
                      (hours * 3600) + (minutes * 60) + seconds
         return uptime_sec
 
-    @staticmethod
-    def fix_checkpoint_string(string, filename):
-        # used to generate checkpoint-like files
-        pattern = '''!Command: Checkpoint cmd vdc 1'''
-
-        if '!Command' in string:
-            return re.sub('!Command.*', pattern.format(filename), string)
-        else:
-            return "{0}\n{1}".format(pattern.format(filename), string)
-
     def is_alive(self):
         """Returns a flag with the state of the SSH connection."""
         null = chr(0)
@@ -512,18 +502,12 @@ class NXOSSSHDriver(NetworkDriver):
 
     def _replace_candidate(self, filename, config):
         if not filename:
-            file_content = self.fix_checkpoint_string(config, self.replace_file)
             filename = self._create_tmp_file(config)
         else:
             if not os.path.isfile(filename):
                 raise ReplaceConfigException("File {} not found".format(filename))
 
         self.replace_file = filename
-        with open(self.replace_file, 'r+') as f:
-            file_content = f.read()
-            file_content = self.fix_checkpoint_string(file_content, self.replace_file)
-            f.write(file_content)
-
         if not self._enough_space(self.replace_file):
             msg = 'Could not transfer file. Not enough space on device.'
             raise ReplaceConfigException(msg)
@@ -668,9 +652,9 @@ class NXOSSSHDriver(NetworkDriver):
         if 'Invalid command' in output:
             raise MergeConfigException('Error while applying config!')
         if not self._save():
-            raise CommandErrorException('Unable to commit config!')
+            raise CommandErrorException('Unable to save running-config to startup!')
 
-    def _save_config(self, filename):
+    def _save_to_checkpoint(self, filename):
         """Save the current running config to the given file."""
         command = 'checkpoint file {}'.format(filename)
         self.device.send_command(command)
@@ -678,15 +662,12 @@ class NXOSSSHDriver(NetworkDriver):
     def _disable_confirmation(self):
         self._send_config_commands(['terminal dont-ask'])
 
-    def _load_config(self):
+    def _load_cfg_from_checkpoint(self):
         command = 'rollback running file {0}'.format(self.replace_file.split('/')[-1])
         self._disable_confirmation()
-        try:
-            rollback_result = self.device.send_command(command)
-        except Exception:
-            return False
-        if 'Rollback failed.' in rollback_result['msg'] or 'ERROR' in rollback_result:
-            raise ReplaceConfigException(rollback_result['msg'])
+        rollback_result = self.device.send_command(command)
+        if 'Rollback failed.' in rollback_result or 'ERROR' in rollback_result:
+            raise ReplaceConfigException(rollback_result)
         elif rollback_result == []:
             return False
         return True
@@ -694,9 +675,11 @@ class NXOSSSHDriver(NetworkDriver):
     def commit_config(self):
         if self.loaded:
             self.backup_file = 'config_' + str(datetime.now()).replace(' ', '_')
-            self._save_config(self.backup_file)
+            # Create Checkpoint from current running-config
+            self._save_to_checkpoint(self.backup_file)
             if self.replace:
-                if self._load_config() is False:
+                cfg_replace_status = self._load_cfg_from_checkpoint()
+                if not cfg_replace_status:
                     raise ReplaceConfigException
             else:
                 try:
@@ -704,7 +687,6 @@ class NXOSSSHDriver(NetworkDriver):
                     self.merge_candidate = ''  # clear the merge buffer
                 except Exception as e:
                     raise MergeConfigException(str(e))
-
             self.changed = True
             self.loaded = False
         else:
@@ -726,16 +708,14 @@ class NXOSSSHDriver(NetworkDriver):
             self._delete_file(self.replace_file)
         self.loaded = False
 
-    def _rollback_ssh(self, backup_file):
-        command = 'rollback running-config file %s' % backup_file
-        result = self.device.send_command(command)
-        if 'completed' not in result.lower():
-            raise ReplaceConfigException(result)
-        self._save_ssh()
-
     def rollback(self):
         if self.changed:
-            self._rollback_ssh(self.backup_file)
+            command = 'rollback running-config file {}'.format(self.backup_file)
+            result = self.device.send_command(command)
+            if 'completed' not in result.lower():
+                raise ReplaceConfigException(result)
+            if not self._save():
+                raise CommandErrorException('Unable to save running-config to startup!')
             self.changed = False
 
     def _apply_key_map(self, key_map, table):
@@ -758,7 +738,7 @@ class NXOSSSHDriver(NetworkDriver):
         # default values.
         vendor = u'Cisco'
         uptime = -1
-        serial_number, fqdn, os_version, hostname = (u'Unknown', u'Unknown', u'Unknown', u'Unknown')
+        serial_number, fqdn, os_version, hostname, domain_name = ('',) * 5
 
         # obtain output from device
         show_ver = self.device.send_command('show version')
@@ -793,11 +773,10 @@ class NXOSSSHDriver(NetworkDriver):
                 _, domain_name = re.split(r".*Default domain.*is ", line)
                 domain_name = domain_name.strip()
                 break
-        if domain_name != 'Unknown' and hostname != 'Unknown':
-            if hostname.count(".") >= 2:
-                fqdn = hostname
-            else:
-                fqdn = '{}.{}'.format(hostname, domain_name)
+        if hostname.count(".") >= 2:
+            fqdn = hostname
+        elif domain_name:
+            fqdn = '{}.{}'.format(hostname, domain_name)
 
         # interface_list filter
         interface_list = []
@@ -1098,14 +1077,18 @@ class NXOSSSHDriver(NetworkDriver):
             else:
                 raise ValueError("Unexpected output from: {}".format(line.split()))
 
-            try:
-                if age == '-':
-                    age = 0
+            if age == '-':
+                age = -1.0
+            elif ':' not in age:
+                # Cisco sometimes returns a sub second arp time 0.411797
+                try:
+                    age = float(age)
+                except ValueError:
+                    age = -1.0
+            else:
                 age = convert_hhmmss(age)
                 age = float(age)
-                age = round(age, 1)
-            except ValueError:
-                raise ValueError("Unable to convert age value to float: {}".format(age))
+            age = round(age, 1)
 
             # Validate we matched correctly
             if not re.search(RE_IPADDR, address):
@@ -1263,9 +1246,10 @@ class NXOSSSHDriver(NetworkDriver):
         """
 
         #  The '*' is stripped out later
-        RE_MACTABLE_FORMAT1 = r"^\s+{}\s+{}\s+\S+\s+\S+\s+\S+\s+\S+\s+\S+".format(
-                                                                           VLAN_REGEX,
-                                                                           MAC_REGEX)  # 7 fields
+        RE_MACTABLE_FORMAT1 = r"^\s+{}\s+{}\s+\S+\s+\S+\s+\S+\s+\S+\s+\S+".format(VLAN_REGEX,
+                                                                                  MAC_REGEX)
+        RE_MACTABLE_FORMAT2 = r"^\s+{}\s+{}\s+\S+\s+\S+\s+\S+\s+\S+\s+\S+".format('-',
+                                                                                  MAC_REGEX)
 
         mac_address_table = []
         command = 'show mac address-table'
@@ -1279,6 +1263,8 @@ class NXOSSSHDriver(NetworkDriver):
             if mac_type.lower() in ['self', 'static', 'system']:
                 static = True
                 if vlan.lower() == 'all':
+                    vlan = 0
+                elif vlan == '-':
                     vlan = 0
                 if interface.lower() == 'cpu' or re.search(r'router', interface.lower()) or \
                         re.search(r'switch', interface.lower()):
@@ -1302,8 +1288,8 @@ class NXOSSSHDriver(NetworkDriver):
         # Skip the header lines
         output = re.split(r'^----.*', output, flags=re.M)[1:]
         output = "\n".join(output).strip()
-        # Strip any leading astericks
-        output = re.sub(r"^\*", "", output, flags=re.M)
+        # Strip any leading astericks or G character
+        output = re.sub(r"^[\*G]", "", output, flags=re.M)
 
         for line in output.splitlines():
 
@@ -1321,14 +1307,13 @@ class NXOSSSHDriver(NetworkDriver):
                 continue
             elif re.search('^\s*$', line):
                 continue
-            # Format1
-            elif re.search(RE_MACTABLE_FORMAT1, line):
-                if len(line.split()) == 7:
-                    vlan, mac, mac_type, _, _, _, interface = line.split()
-                    mac_address_table.append(process_mac_fields(vlan, mac, mac_type, interface))
-                else:
-                    raise ValueError("Unexpected output from: {}".format(line.split()))
 
+            for pattern in [RE_MACTABLE_FORMAT1, RE_MACTABLE_FORMAT2]:
+                if re.search(pattern, line):
+                    if len(line.split()) == 7:
+                        vlan, mac, mac_type, _, _, _, interface = line.split()
+                        mac_address_table.append(process_mac_fields(vlan, mac, mac_type, interface))
+                        break
             else:
                 raise ValueError("Unexpected output from: {}".format(repr(line)))
 
